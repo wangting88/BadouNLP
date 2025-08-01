@@ -1,211 +1,187 @@
-# coding:utf8
+import json
 import torch
 import torch.nn as nn
-import numpy as np
-import math
-import random
-import os
-import re
-import json
-from transformers import BertTokenizer, BertModel
 from torch.utils.data import Dataset, DataLoader
-
-"""
-基于BERT的Seq2Seq生成模型（监督式微调）
-"""
-
-
-class LanguageModel(nn.Module):
-    def __init__(self, hidden_size, vocab_size, pretrain_model_path, sep_token_id):
-        super(LanguageModel, self).__init__()
-        self.bert = BertModel.from_pretrained(pretrain_model_path, return_dict=False)
-        self.classify = nn.Linear(hidden_size, vocab_size)
-        self.loss = nn.CrossEntropyLoss(ignore_index=0)  # 忽略padding部分的损失
-        self.sep_token_id = sep_token_id  # 保存[SEP]标记的ID
-
-    def forward(self, x, y=None):
-        # 训练模式：计算损失
-        if y is not None:
-            # 构建下三角注意力掩码（防止看到未来信息）
-            seq_len = x.shape[1]
-            mask = torch.tril(torch.ones((x.shape[0], seq_len, seq_len)))
-            if torch.cuda.is_available():
-                mask = mask.cuda()
-
-            outputs, _ = self.bert(x, attention_mask=mask)
-            y_pred = self.classify(outputs)  # [batch_size, seq_len, vocab_size]
-
-            # 只计算正文部分的损失（跳过[CLS]和标题）
-            # 假设输入格式: [CLS] + 标题 + [SEP] + 正文
-            sep_idx = (x == self.sep_token_id).nonzero(as_tuple=True)
-            loss_mask = torch.zeros_like(y)
-
-            # 确保每个样本都有找到[SEP]标记
-            if len(sep_idx[0]) > 0:
-                # 获取每个样本中第一个[SEP]的位置
-                batch_indices = sep_idx[0]
-                token_indices = sep_idx[1]
-
-                # 为每个样本创建位置映射
-                for i in range(x.size(0)):
-                    # 找到当前样本的所有[SEP]位置
-                    sample_sep = token_indices[batch_indices == i]
-                    if len(sample_sep) > 0:
-                        first_sep = sample_sep[0]  # 取第一个[SEP]
-                        if first_sep + 1 < y.size(1):  # 确保不越界
-                            loss_mask[i, first_sep + 1:] = 1  # 从[SEP]后开始计算损失
-
-            # 计算掩码损失
-            active_loss = loss_mask.view(-1) == 1
-            active_logits = y_pred.view(-1, y_pred.shape[-1])[active_loss]
-            active_labels = y.view(-1)[active_loss]
-
-            if active_logits.numel() > 0:  # 确保有激活的损失
-                return self.loss(active_logits, active_labels)
-            else:
-                return torch.tensor(0.0, device=x.device)  # 返回零损失
-
-        # 生成模式：返回预测概率
-        else:
-            # 预测时同样使用掩码
-            seq_len = x.shape[1]
-            mask = torch.tril(torch.ones((x.shape[0], seq_len, seq_len)))
-            if torch.cuda.is_available():
-                mask = mask.cuda()
-            outputs, _ = self.bert(x, attention_mask=mask)
-            y_pred = self.classify(outputs)
-            return torch.softmax(y_pred, dim=-1)
+from transformers import BertTokenizer, BertLMHeadModel, AdamW
+from transformers import get_linear_schedule_with_warmup
+import numpy as np
+import random
 
 
-# 加载JSON语料
-def load_json_corpus(json_path):
-    samples = []
-    with open(json_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            data = json.loads(line)
-            samples.append((data["title"], data["content"]))
-    return samples
+# 设置随机种子确保可复现性
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
-# 构建单条训练样本
-def build_sample(tokenizer, title, content, max_length=128):
-    # 输入格式: [CLS] + 标题 + [SEP] + 正文
-    input_text = f"[CLS]{title}[SEP]{content}"
-    input_ids = tokenizer.encode(
-        input_text,
-        add_special_tokens=False,  # 已手动添加特殊标记
-        max_length=max_length,
-        truncation=True,
-        padding='max_length'
-    )
-
-    # 目标输出：正文部分（忽略标题）
-    target_ids = tokenizer.encode(
-        content,
-        add_special_tokens=False,
-        max_length=max_length,
-        truncation=True,
-        padding='max_length'
-    )
-    return torch.LongTensor(input_ids), torch.LongTensor(target_ids)
+set_seed()
 
 
-# 构建数据集
-class JsonDataset(Dataset):
-    def __init__(self, samples, tokenizer, max_length):
-        self.samples = samples
+# 1. 数据加载与预处理
+class NewsDataset(Dataset):
+    def __init__(self, file_path, tokenizer, max_length=512):
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.data = []
+
+        # 读取JSON文件
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:  # 跳过空行
+                    try:
+                        item = json.loads(line)
+                        title = item['title']
+                        content = item['content']
+                        self.data.append((title, content))
+                    except json.JSONDecodeError:
+                        continue
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.data)
 
     def __getitem__(self, idx):
-        title, content = self.samples[idx]
-        return build_sample(self.tokenizer, title, content, self.max_length)
+        title, content = self.data[idx]
+
+        # 构建输入格式：标题 + 分隔符 + 正文
+        input_text = f"标题：{title} 正文：{content}"
+        # 编码
+        encoding = self.tokenizer(
+            input_text,
+            truncation=True,
+            max_length=self.max_length,
+            padding='max_length',
+            return_tensors='pt'
+        )
+
+        # 提取输入ID和注意力掩码
+        input_ids = encoding['input_ids'].flatten()
+        attention_mask = encoding['attention_mask'].flatten()
+
+        # 构建标签（仅正文部分需要计算损失）
+        title_part = f"标题：{title} 正文："
+        title_len = len(self.tokenizer.encode(title_part, add_special_tokens=False))
+        labels = input_ids.clone()
+        labels[:title_len] = -100  # 标题部分不计算损失
+
+        return {
+            'input_ids': input_ids,
+            'attention_mask': attention_mask,
+            'labels': labels
+        }
 
 
-# 文本生成函数
-def generate_text(model, tokenizer, title, max_length=50, temperature=1.0):
-    model.eval()
-    # 初始输入: [CLS] + 标题 + [SEP]
-    input_text = f"[CLS]{title}[SEP]"
-    input_ids = tokenizer.encode(input_text, add_special_tokens=False)
-    generated = []
-
-    for _ in range(max_length):
-        x = torch.LongTensor([input_ids])
-        if torch.cuda.is_available():
-            x = x.cuda()
-
-        with torch.no_grad():
-            probs = model(x)[0][-1]  # 最后一个位置的预测概率
-
-        probs = probs / temperature
-        next_token = torch.multinomial(torch.softmax(probs, dim=-1), 1).item()
-
-        # 遇到[SEP]或[PAD]停止
-        if next_token == tokenizer.sep_token_id or next_token == tokenizer.pad_token_id:
-            break
-
-        generated.append(next_token)
-        input_ids.append(next_token)  # 将生成词加入输入
-
-    return tokenizer.decode(generated)
+# 2. 模型定义
+def load_model_and_tokenizer(model_name=r"D:\练习\AI学习\新建文件夹\bert-base-chinese"):
+    tokenizer = BertTokenizer.from_pretrained(model_name)
+    # 加载模型时指定is_decoder=True，解决警告问题
+    model = BertLMHeadModel.from_pretrained(model_name, is_decoder=True)
+    return model, tokenizer
 
 
-# 训练函数
-def train(json_path, save_weight=True):
-    epoch_num = 20
-    batch_size = 32
-    max_length = 512  # 最大序列长度
-    pretrain_model_path = r"D:\练习\AI学习\新建文件夹\bert-base-chinese"
-    tokenizer = BertTokenizer.from_pretrained(pretrain_model_path)
-
-    # 特殊标记处理（确保[CLS]和[SEP]在词表中）
-    if tokenizer.cls_token_id is None:
-        tokenizer.add_special_tokens({'cls_token': '[CLS]'})
-    if tokenizer.sep_token_id is None:
-        tokenizer.add_special_tokens({'sep_token': '[SEP]'})
-
-    # 加载数据
-    samples = load_json_corpus(json_path)
-    dataset = JsonDataset(samples, tokenizer, max_length)
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    # 初始化模型 - 传递sep_token_id
-    model = LanguageModel(768, tokenizer.vocab_size, pretrain_model_path, tokenizer.sep_token_id)
-    if torch.cuda.is_available():
-        model = model.cuda()
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-5)
-
-    print("开始训练...")
-    for epoch in range(epoch_num):
-        model.train()
+# 3. 训练函数
+def train(model, train_loader, optimizer, scheduler, device, epochs=3):
+    model.train()
+    for epoch in range(epochs):
         total_loss = 0
-        for x, y in dataloader:
-            if torch.cuda.is_available():
-                x, y = x.cuda(), y.cuda()
+        for batch in train_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
 
             optimizer.zero_grad()
-            loss = model(x, y)
-            loss.backward()
-            optimizer.step()
+
+            # BertLMHeadModel返回的是元组，第一个元素是loss
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels
+            )
+
+            # 从元组中获取loss（第一个元素）
+            loss = outputs[0]
             total_loss += loss.item()
 
-        avg_loss = total_loss / len(dataloader)
-        print(f"Epoch {epoch + 1}/{epoch_num}, Loss: {avg_loss:.4f}")
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
 
-        # 生成示例
-        test_title = "阿根廷歹徒抢服装尺码不对拿回店里换"
-        generated_content = generate_text(model, tokenizer, test_title)
-        print(f"标题: {test_title}\n生成正文: {generated_content}\n")
+        avg_loss = total_loss / len(train_loader)
+        print(f"Epoch {epoch + 1}/{epochs}, Average Loss: {avg_loss:.4f}")
+
+
+# 4. 生成函数
+def generate_content(title, model, tokenizer, device, max_length=200):
+    model.eval()
+    input_text = f"标题：{title} 正文："
+    input_ids = tokenizer.encode(input_text, return_tensors='pt').to(device)
+
+    with torch.no_grad():
+        output = model.generate(
+            input_ids,
+            max_length=max_length,
+            num_return_sequences=1,
+            no_repeat_ngram_size=2,
+            do_sample=True,  # 启用采样模式（与temperature配合）
+            temperature=0.7,
+            top_k=50,
+            num_beams=1,    # 明确单 beam 模式
+            early_stopping=False  # 单 beam 时关闭 early_stopping
+        )
+
+    generated_text = tokenizer.decode(output[0], skip_special_tokens=True)
+    content = generated_text.split("正文：")[-1].strip()
+    return content
+
+
+# 5. 主函数
+def main():
+    # 配置参数
+    file_path = r"D:\练习\AI学习\新建文件夹\sample_data.json"
+    model_name = r"D:\练习\AI学习\新建文件夹\bert-base-chinese"
+    batch_size = 2
+    learning_rate = 2e-5
+    epochs = 20
+    max_length = 512
+
+    # 设备配置
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # 加载模型和分词器
+    model, tokenizer = load_model_and_tokenizer(model_name)
+    model.to(device)
+
+    # 加载数据集
+    dataset = NewsDataset(file_path, tokenizer, max_length)
+    train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # 优化器 - 使用PyTorch原生的AdamW避免警告
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    total_steps = len(train_loader) * epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=0,
+        num_training_steps=total_steps
+    )
+
+    # 训练模型
+    print("开始训练...")
+    train(model, train_loader, optimizer, scheduler, device, epochs)
 
     # 保存模型
-    if save_weight:
-        torch.save(model.state_dict(), "bert_generator.pth")
+    torch.save(model.state_dict(), "title2content_model.pt")
+    print("模型保存完成")
+
+    # 测试生成
+    test_title = "人工智能助力环境保护"
+    generated_content = generate_content(test_title, model, tokenizer, device)
+    print(f"\n测试生成:")
+    print(f"标题: {test_title}")
+    print(f"生成正文: {generated_content}")
 
 
 if __name__ == "__main__":
-    train(r"D:\练习\AI学习\新建文件夹\sample_data.json", save_weight=True)
+    main()
