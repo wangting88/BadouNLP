@@ -4,8 +4,6 @@ import json
 import re
 import os
 import torch
-import random
-import jieba
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from collections import defaultdict
@@ -15,134 +13,117 @@ from collections import defaultdict
 
 
 class DataGenerator:
-    def __init__(self, data_path, config):
+    def __init__(self, data_path, config, logger):
         self.config = config
+        self.logger = logger
         self.path = data_path
         self.vocab = load_vocab(config["vocab_path"])
         self.config["vocab_size"] = len(self.vocab)
-        self.schema = load_schema(config["schema_path"])
-        self.train_data_size = config["epoch_data_size"] #由于采取随机采样，所以需要设定一个采样数量，否则可以一直采
-        self.data_type = None  #用来标识加载的是训练集还是测试集 "train" or "test"
+        self.config["pad_idx"] = self.vocab["[PAD]"]
+        self.config["start_idx"] = self.vocab["[CLS]"]
+        self.config["end_idx"] = self.vocab["[SEP]"]
         self.load()
 
     def load(self):
         self.data = []
-        self.knwb = defaultdict(list)
         with open(self.path, encoding="utf8") as f:
-            for line in f:
+            for i, line in enumerate(f):
                 line = json.loads(line)
-                #加载训练集
-                if isinstance(line, dict):
-                    self.data_type = "train"
-                    questions = line["questions"]
-                    label = line["target"]
-                    for question in questions:
-                        input_id = self.encode_sentence(question)
-                        input_id = torch.LongTensor(input_id)
-                        self.knwb[self.schema[label]].append(input_id)
-                #加载测试集
-                else:
-                    self.data_type = "test"
-                    assert isinstance(line, list)
-                    question, label = line
-                    input_id = self.encode_sentence(question)
-                    input_id = torch.LongTensor(input_id)
-                    label_index = torch.LongTensor([self.schema[label]])
-                    self.data.append([input_id, label_index])
+                title = line["title"]
+                content = line["content"]
+                self.prepare_data(title, content)
         return
 
-    def encode_sentence(self, text):
+    #文本到对应的index
+    #头尾分别加入[cls]和[sep]
+    def encode_sentence(self, text, max_length, with_cls_token=True, with_sep_token=True):
         input_id = []
-        if self.config["vocab_path"] == "words.txt":
-            for word in jieba.cut(text):
-                input_id.append(self.vocab.get(word, self.vocab["[UNK]"]))
-        else:
-            for char in text:
+        if with_cls_token:
+            input_id.append(self.vocab["[CLS]"])
+        for char in text:
+            if char == self.vocab["[MASK]"]:
+                input_id.append(self.vocab["[MASK]"])
+            else:
                 input_id.append(self.vocab.get(char, self.vocab["[UNK]"]))
-        input_id = self.padding(input_id)
+        if with_sep_token:
+            input_id.append(self.vocab["[SEP]"])
+        input_id = self.padding(input_id, max_length)
         return input_id
 
     #补齐或截断输入的序列，使其可以在一个batch内运算
-    def padding(self, input_id):
-        input_id = input_id[:self.config["max_length"]]
-        input_id += [0] * (self.config["max_length"] - len(input_id))
+    def padding(self, input_id, length):
+        input_id = input_id[:length]
+        input_id += [self.vocab["[PAD]"]] * (length - len(input_id))
         return input_id
 
+    def mask_sentence(self, content):
+        """
+        对输入的句子进行mask处理，使其成为预测下一个token的任务。
+        具体是将content中的每一个字符依次mask掉，然后使用前面的字符预测后面被mask掉的字符
+        """
+        masked_data = []
+        l = len(content)
+        content_list = list(content)
+        for i in range(l):
+            mask_seq = content_list[:i] + [self.vocab["[MASK]"]] * (l - i)
+            masked_data.append(mask_seq)
+        return masked_data
+    
+    #输入输出转化成序列
+    def prepare_data(self, title, content):
+
+        l = len(content)
+        t = len(title)
+        masked_seqs = self.mask_sentence(content)
+
+        for i in range(1,l):
+            input_seq = list(title) + masked_seqs[i-1]
+            output_seq = list(title) + masked_seqs[i]
+            
+            input_seq = self.encode_sentence(input_seq, self.config["input_max_length"])
+            output_seq = self.encode_sentence(output_seq, self.config["output_max_length"])
+            gold = self.encode_sentence(output_seq, self.config["output_max_length"])
+
+            self.data.append([torch.LongTensor(input_seq),
+                            torch.LongTensor(output_seq),
+                            torch.LongTensor(gold)])
+        
+        input_seq = self.encode_sentence(content, self.config["input_max_length"], False, False) #输入序列
+        output_seq = self.encode_sentence(title, self.config["output_max_length"], True, False) #输出序列
+
+        gold = self.encode_sentence(title, self.config["output_max_length"], False, True) #不进入模型，用于计算loss
+
+        self.data.append([torch.LongTensor(input_seq),
+                          torch.LongTensor(output_seq),
+                          torch.LongTensor(gold)])
+
+        return
+
+
     def __len__(self):
-        if self.data_type == "train":
-            return self.config["epoch_data_size"]
-        else:
-            assert self.data_type == "test", self.data_type
-            return len(self.data)
+        return len(self.data)
 
     def __getitem__(self, index):
-        if self.data_type == "train":
-            return self.random_train_sample() #随机生成一个训练样本
-        else:
-            return self.data[index]
-
-    #依照一定概率生成负样本或正样本
-    #负样本从随机两个不同的标准问题中各随机选取一个
-    #正样本从随机一个标准问题中随机选取两个
-#    def random_train_sample(self):
-        standard_question_index = list(self.knwb.keys())
-        #随机正样本
-        if random.random() <= self.config["positive_sample_rate"]:
-            p = random.choice(standard_question_index)
-            #如果选取到的标准问下不足两个问题，则无法选取，所以重新随机一次
-            if len(self.knwb[p]) < 2:
-                return self.random_train_sample()
-            else:
-                s1, s2 = random.sample(self.knwb[p], 2)
-                return [s1, s2, torch.LongTensor([1])]
-        #随机负样本
-        else:
-            p, n = random.sample(standard_question_index, 2)
-            s1 = random.choice(self.knwb[p])
-            s2 = random.choice(self.knwb[n])
-            return [s1, s2, torch.LongTensor([-1])]
-        
-    def random_train_sample(self):
-        """随机生成三元组样本
-        return [anchor, positive, negative]"""
-        standard_question_index = list(self.knwb.keys())
-        p = random.choice(standard_question_index)
-        #如果选取到的标准问下不足两个问题，则无法选取，所以重新随机一次
-        if len(self.knwb[p]) < 2:
-            return self.random_train_sample()
-        else:
-            s1, s2 = random.sample(self.knwb[p], 2)
-            n = random.choice(standard_question_index)
-            while n == p:
-                n = random.choice(standard_question_index)
-            s3 = random.choice(self.knwb[n])
-        return [s1, s2, s3]
+        return self.data[index]
 
 
-
-#加载字表或词表
 def load_vocab(vocab_path):
     token_dict = {}
     with open(vocab_path, encoding="utf8") as f:
         for index, line in enumerate(f):
             token = line.strip()
-            token_dict[token] = index + 1  #0留给padding位置，所以从1开始
+            token_dict[token] = index
     return token_dict
 
-#加载schema
-def load_schema(schema_path):
-    with open(schema_path, encoding="utf8") as f:
-        return json.loads(f.read())
-
 #用torch自带的DataLoader类封装数据
-def load_data(data_path, config, shuffle=True):
-    dg = DataGenerator(data_path, config)
+def load_data(data_path, config, logger, shuffle=True):
+    dg = DataGenerator(data_path, config, logger)
     dl = DataLoader(dg, batch_size=config["batch_size"], shuffle=shuffle)
     return dl
 
 
-
 if __name__ == "__main__":
     from config import Config
-    dg = DataGenerator("../data/train.json", Config)
-    print(dg[1])
+    dl = load_data(Config["train_data_path"], Config, 1)
+    print([(i, k) for i, k in enumerate(dl.dataset.data) if i == 0] )
+
